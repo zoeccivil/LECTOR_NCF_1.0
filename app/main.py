@@ -34,9 +34,16 @@ FIREBASE_CRED_PATH = CREDENTIALS_DIR / "firebase-credentials.json"
 
 
 def check_firebase_credentials():
-    """Returns True if the Firebase credentials file exists."""
-    return FIREBASE_CRED_PATH.exists()
-
+    """Returns True if Firebase credentials are configured (file or Base64)."""
+    # Check if file exists locally
+    if FIREBASE_CRED_PATH.exists():
+        return True
+    
+    # Check if Base64 credentials exist in environment
+    if os.environ.get("FIREBASE_CREDENTIALS_BASE64"):
+        return True
+    
+    return False
 
 @app.on_event("startup")
 async def startup_event():
