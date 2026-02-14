@@ -100,9 +100,8 @@ async def greenapi_polling_loop():
 async def process_greenapi_notification(notification: dict):
     """Process incoming Green-API notification"""
     try:
-        # Extract notification type and body
+        # Extract notification type
         type_webhook = notification.get("typeWebhook")
-        body = notification.get("body", {})
         
         app_logger.info(f"Type: {type_webhook}")
         
@@ -110,9 +109,9 @@ async def process_greenapi_notification(notification: dict):
         if type_webhook != "incomingMessageReceived":
             return
         
-        # Extract message data
-        message_data = body.get("messageData", {})
-        sender_data = body.get("senderData", {})
+        # Extract message data (directly from root, not from body)
+        message_data = notification.get("messageData", {})
+        sender_data = notification.get("senderData", {})
         
         sender = sender_data.get("sender", "")  # Format: 18293757344@c.us
         message_type = message_data.get("typeMessage", "")
@@ -153,8 +152,9 @@ async def process_greenapi_notification(notification: dict):
             await process_invoice_image(sender_whatsapp, image_bytes)
         
         elif message_type == "textMessage":
-            text_message = message_data.get("textMessageData", {}).get("textMessage", "")
-            app_logger.info(f"Text message: {text_message}")
+            text_message_data = message_data.get("textMessageData", {})
+            text_message = text_message_data.get("textMessage", "")
+            app_logger.info(f"📝 Text message: {text_message}")
             
             await unified_handler.send_message(
                 sender_whatsapp,
@@ -162,10 +162,10 @@ async def process_greenapi_notification(notification: dict):
             )
         
         else:
-            app_logger.info(f"Unsupported message type: {message_type}")
+            app_logger.info(f"⚠️ Unsupported message type: {message_type}")
     
     except Exception as e:
-        app_logger.error(f"Error processing Green-API notification: {e}")
+        app_logger.error(f"❌ Error processing Green-API notification: {e}")
         import traceback
         traceback.print_exc()
 
