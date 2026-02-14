@@ -11,6 +11,7 @@ import os
 import shutil
 import json
 import asyncio
+import httpx
 
 from app.utils.logger import app_logger
 from app.utils.config import settings
@@ -68,25 +69,28 @@ async def startup_event():
     if not check_firebase_credentials():
         app_logger.warning("⚠️ FIREBASE CREDENTIALS NOT FOUND. Please visit /setup to configure them.")
     
-    # Start Green-API polling if enabled
+    # Start Green-API polling if enabled (BACKUP para webhook)
     if greenapi_handler.enabled:
         app_logger.info("🔄 Starting Green-API polling task...")
         asyncio.create_task(greenapi_polling_loop())
-        app_logger.info("✅ Green-API polling started")
+        app_logger.info("✅ Green-API polling started (webhook + polling dual mode)")
 
 
 async def greenapi_polling_loop():
-    """Background task to poll Green-API for incoming messages"""
+    """Background task to poll Green-API for incoming messages (backup to webhook)"""
     app_logger.info("🔄 Green-API polling loop started")
+    
+    # Esperar 10 segundos antes de iniciar polling
+    await asyncio.sleep(10)
     
     while True:
         try:
             notification = await greenapi_handler.receive_notification()
             
             if notification:
-                app_logger.info(f"📥 GREEN-API MESSAGE: {notification}")
+                app_logger.info(f"📥 POLLING RECEIVED: {notification.get('typeWebhook')}")
                 
-                # Process incoming message
+                # Process incoming message (mismo handler que webhook)
                 await process_greenapi_notification(notification)
             
             # Poll every 5 seconds
@@ -98,66 +102,96 @@ async def greenapi_polling_loop():
 
 
 async def process_greenapi_notification(notification: dict):
-    """Process incoming Green-API notification"""
+    """Process incoming Green-API notification (usado por webhook Y polling)"""
     try:
         # Extract notification type
         type_webhook = notification.get("typeWebhook")
         
+        app_logger.info("=" * 70)
+        app_logger.info("📥 GREEN-API MESSAGE")
         app_logger.info(f"Type: {type_webhook}")
+        app_logger.info("=" * 70)
+        
+        # Ignorar mensajes salientes
+        if type_webhook in ["outgoingMessageStatus", "outgoingAPIMessageReceived"]:
+            app_logger.info("⏭️ Skipping outgoing message")
+            return
         
         # Only process incoming messages
         if type_webhook != "incomingMessageReceived":
             return
         
-        # Extract message data (directly from root, not from body)
+        # Extract message data
         message_data = notification.get("messageData", {})
         sender_data = notification.get("senderData", {})
         
-        sender = sender_data.get("sender", "")  # Format: 18293757344@c.us
+        # Get sender
+        chat_id = sender_data.get("chatId", "")
+        sender = sender_data.get("sender", "")
         message_type = message_data.get("typeMessage", "")
         
-        # Convert sender format: 18293757344@c.us -> whatsapp:+18293757344
-        sender_phone = sender.replace("@c.us", "")
-        sender_whatsapp = f"whatsapp:+{sender_phone}"
+        # Extract phone number
+        phone = chat_id.split("@")[0] or sender.split("@")[0]
+        from_number = f"whatsapp:+{phone}"
         
-        app_logger.info(f"From: {sender_whatsapp}, Type: {message_type}")
+        app_logger.info(f"From: {from_number}, Type: {message_type}")
         
         # Process image messages
         if message_type == "imageMessage":
-            download_url = message_data.get("downloadUrl")
+            app_logger.info(f"Processing image from {from_number}")
+            
+            # Send confirmation
+            await unified_handler.send_confirmation(from_number)
+            
+            # Extract download URL from multiple possible locations
+            file_message_data = message_data.get("fileMessageData", {})
+            download_url = (
+                file_message_data.get("downloadUrl") or
+                message_data.get("downloadUrl") or
+                message_data.get("imageMessageData", {}).get("downloadUrl")
+            )
+            
+            app_logger.info(f"🔍 Extracted download_url: {download_url}")
             
             if not download_url:
-                app_logger.error("No download URL in image message")
-                await unified_handler.send_error(sender_whatsapp, "No se encontró la imagen")
+                app_logger.error("❌ downloadUrl not found in messageData")
+                app_logger.error(f"📋 messageData keys: {list(message_data.keys())}")
+                app_logger.error(f"📋 Full messageData: {json.dumps(message_data, indent=2)}")
+                await unified_handler.send_error(from_number, "No se pudo obtener URL de descarga")
                 return
             
             app_logger.info(f"⬇️ Downloading from: {download_url}")
             
             # Download image
-            async with httpx.AsyncClient() as client:
-                response = await client.get(download_url, timeout=30.0)
+            try:
+                async with httpx.AsyncClient() as client:
+                    img_response = await client.get(download_url, timeout=30.0)
+                    img_response.raise_for_status()
+                    image_bytes = img_response.content
                 
-                if response.status_code != 200:
-                    app_logger.error(f"Failed to download image: {response.status_code}")
-                    await unified_handler.send_error(sender_whatsapp, "No se pudo descargar la imagen")
-                    return
-                
-                image_bytes = response.content
                 app_logger.info(f"✅ Image downloaded: {len(image_bytes)} bytes")
-            
-            # Send confirmation
-            await unified_handler.send_confirmation(sender_whatsapp)
+            except Exception as e:
+                app_logger.error(f"❌ Download failed: {e}")
+                await unified_handler.send_error(from_number, f"Error descargando imagen: {str(e)}")
+                return
             
             # Process invoice
-            await process_invoice_image(sender_whatsapp, image_bytes)
+            await process_invoice_image(from_number, image_bytes)
         
-        elif message_type == "textMessage":
+        elif message_type in ["textMessage", "extendedTextMessage"]:
+            # Extract text from either format
             text_message_data = message_data.get("textMessageData", {})
-            text_message = text_message_data.get("textMessage", "")
+            extended_text_data = message_data.get("extendedTextMessageData", {})
+            
+            text_message = (
+                text_message_data.get("textMessage", "") or
+                extended_text_data.get("text", "")
+            )
+            
             app_logger.info(f"📝 Text message: {text_message}")
             
             await unified_handler.send_message(
-                sender_whatsapp,
+                from_number,
                 "Por favor envía una foto de la factura. 📸"
             )
         
@@ -167,7 +201,7 @@ async def process_greenapi_notification(notification: dict):
     except Exception as e:
         app_logger.error(f"❌ Error processing Green-API notification: {e}")
         import traceback
-        traceback.print_exc()
+        app_logger.error(traceback.format_exc())
 
 
 async def process_invoice_image(sender: str, image_bytes: bytes):
@@ -401,7 +435,7 @@ async def greenapi_webhook(request: Request):
     """Webhook endpoint for Green-API (alternative to polling)"""
     try:
         notification = await request.json()
-        app_logger.info(f"📥 GREEN-API WEBHOOK: {notification}")
+        app_logger.info(f"📥 GREEN-API WEBHOOK: {notification.get('typeWebhook')}")
         
         await process_greenapi_notification(notification)
         
@@ -410,12 +444,6 @@ async def greenapi_webhook(request: Request):
     except Exception as e:
         app_logger.error(f"Error processing Green-API webhook: {e}")
         return {"status": "error", "message": str(e)}
-
-
-# ==========================================
-# IMPORT HTTPX FOR GREEN-API
-# ==========================================
-import httpx
 
 
 if __name__ == "__main__":
