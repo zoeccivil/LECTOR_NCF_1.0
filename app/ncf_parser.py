@@ -92,13 +92,30 @@ class NCFParser:
         return ncf
     
     def _extract_rnc(self, text: str) -> Optional[str]:
-        """Extract RNC from text"""
-        rnc = extract_rnc_from_text(text)
-        if rnc:
-            app_logger.info(f"Extracted RNC: {rnc}")
-        else:
-            app_logger.warning("RNC not found in text")
-        return rnc
+        """
+        Extract RNC (Registro Nacional de Contribuyentes)
+        Formatos:
+        - 101019921
+        - 1-8311147-2
+        - 133-387263
+        """
+        patterns = [
+            r'RNC[:\s]+(\d{9,11})',                    # RNC: 101019921
+            r'RNC[:\s]*[:]?\s*(\d{9,11})',            # RNC : 101019921
+            r'R\.N\.C\.?\s*:?\s*(\d{9,11})',          # R.N.C: 101019921
+            r'RNC[:\s]+(\d{1,3}-\d{7}-\d{1})',        # RNC: 1-8311147-2 ← NUEVO
+            r'RNC[:\s]+(\d{3}-\d{6})',                # RNC: 133-387263 ← NUEVO
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                rnc = match.group(1).replace('-', '').replace(' ', '')
+                # Validar que sea numérico y longitud correcta
+                if rnc.isdigit() and 9 <= len(rnc) <= 11:
+                    return rnc
+        
+        return None
     
     def _extract_business_name(self, text: str) -> Optional[str]:
         """Extract business/company name from text"""
@@ -149,40 +166,100 @@ class NCFParser:
         app_logger.warning("Date not found in text")
         return None
     
-    def _extract_amounts(self, text: str) -> InvoiceAmounts:
-        """Extract monetary amounts from text"""
-        amounts = InvoiceAmounts()
+    def _extract_amounts(self, text: str):
+        """
+        Extract subtotal, ITBIS, and total amounts
+        Busca en múltiples formatos y líneas
+        """
+        lines = text.split('\n')
         
-        # Normalize text for easier parsing
-        text_lower = text.lower()
+        # ESTRATEGIA 1: TOTAL en la misma línea
+        total_patterns_inline = [
+            r'TOTAL[:\s]+(?:RD\$|RD|[$])\s*([\d,\.]+)',      # TOTAL RD$ 1,234.56
+            r'TOTAL[:\s]+([\d,\.]+)',                         # TOTAL 1,234.56
+            r'TOTAL\s*:\s*(?:RD\$|RD|[$])?\s*([\d,\.]+)',    # TOTAL: RD$1,234.56
+            r'(?:TOTAL\s+A\s+PAGAR)[:\s]+(?:RD\$|RD|[$])?\s*([\d,\.]+)', # TOTAL A PAGAR 1234
+        ]
         
-        # Extract total
-        total_value = self._find_amount_near_keyword(text, text_lower, ['total', 'monto total', 'total general'])
-        if total_value:
-            amounts.total = total_value
-            app_logger.info(f"Extracted total: {total_value}")
+        for pattern in total_patterns_inline:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                total_str = match.group(1).replace(',', '').replace('.', '', total_str.count('.') - 1)
+                try:
+                    self.montos.total = float(total_str)
+                    app_logger.info(f"Total encontrado (inline): {self.montos.total}")
+                    break
+                except ValueError:
+                    continue
         
-        # Extract ITBIS
-        itbis_value = self._find_amount_near_keyword(text, text_lower, ['itbis', 'itebis', 'impuesto', 'tax'])
-        if itbis_value:
-            amounts.itbis = itbis_value
-            app_logger.info(f"Extracted ITBIS: {itbis_value}")
+        # ESTRATEGIA 2: TOTAL en línea separada (buscar en las siguientes 3 líneas)
+        if not self.montos.total:
+            for i, line in enumerate(lines):
+                if re.search(r'\bTOTAL\b', line, re.IGNORECASE):
+                    # Buscar monto en las siguientes 3 líneas
+                    for j in range(i, min(i + 4, len(lines))):
+                        next_line = lines[j]
+                        # Buscar patrón de monto
+                        amount_patterns = [
+                            r'(?:RD\$|RD|[$]|DOP)\s*([\d,\.]+)',
+                            r'^\s*([\d,\.]+)\s*$',
+                            r'Monto\s*\$?([\d,\.]+)',
+                        ]
+                        
+                        for pattern in amount_patterns:
+                            match = re.search(pattern, next_line)
+                            if match:
+                                total_str = match.group(1).replace(',', '')
+                                # Manejar punto como separador de miles
+                                if total_str.count('.') > 1:
+                                    total_str = total_str.replace('.', '', total_str.count('.') - 1)
+                                try:
+                                    total = float(total_str)
+                                    # Validar que sea un monto razonable (> 10)
+                                    if total > 10:
+                                        self.montos.total = total
+                                        app_logger.info(f"Total encontrado (multiline): {self.montos.total} en línea {j}")
+                                        break
+                                except ValueError:
+                                    continue
+                        
+                        if self.montos.total:
+                            break
+                    
+                    if self.montos.total:
+                        break
         
-        # Extract subtotal
-        subtotal_value = self._find_amount_near_keyword(text, text_lower, ['subtotal', 'sub total', 'sub-total', 'valor'])
-        if subtotal_value:
-            amounts.subtotal = subtotal_value
-            app_logger.info(f"Extracted subtotal: {subtotal_value}")
+        # SUBTOTAL
+        subtotal_patterns = [
+            r'SUBTOTAL[:\s]+(?:RD\$|RD|[$])?\s*([\d,\.]+)',
+            r'Sub\s*Total[:\s]+(?:RD\$|RD|[$])?\s*([\d,\.]+)',
+        ]
         
-        # Try to calculate missing values
-        amounts = self._calculate_missing_amounts(amounts)
+        for pattern in subtotal_patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                subtotal_str = match.group(1).replace(',', '')
+                try:
+                    self.montos.subtotal = float(subtotal_str)
+                    break
+                except ValueError:
+                    continue
         
-        # Validate coherence
-        if amounts.subtotal and amounts.itbis and amounts.total:
-            if not validate_amount_coherence(amounts.subtotal, amounts.itbis, amounts.total):
-                app_logger.warning("Amount coherence validation failed - values may be incorrect")
+        # ITBIS
+        itbis_patterns = [
+            r'ITBIS[:\s]+(?:RD\$|RD|[$])?\s*([\d,\.]+)',
+            r'(?:18|16)%?\s*ITBIS[:\s]+(?:RD\$|RD|[$])?\s*([\d,\.]+)',
+        ]
         
-        return amounts
+        for pattern in itbis_patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                itbis_str = match.group(1).replace(',', '')
+                try:
+                    self.montos.itbis = float(itbis_str)
+                    break
+                except ValueError:
+                    continue
     
     def _find_amount_near_keyword(self, text: str, text_lower: str, keywords: list) -> Optional[float]:
         """Find amount near specific keywords using word boundary matching"""
